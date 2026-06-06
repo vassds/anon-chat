@@ -69,91 +69,106 @@ async def websocket_endpoint(websocket: WebSocket):
         
         try:
             verify_key.verify(bytes.fromhex(signature_hex), challenge_nonce.encode('utf-8'))
-        except Exception as e:
-            print(f"[!] Auth Failed for {alias}: {e}")
+        except Exception:
             await websocket.close(code=4001)
             return
 
-        # Strict Database Verification Logic
         user = db.query(UserNode).filter(UserNode.alias == alias).first()
         
-        if intent == "login":
-            if not user:
-                print(f"[DEBUG] ❌ Rejected Login: Identity {alias} does not exist.")
-                await websocket.send_text(json.dumps({"type": "auth_error", "message": "Identity not found. Please register first."}))
-                await websocket.close(code=4004)
-                return
-            else:
-                print(f"[DEBUG] ✅ Successful Login for {alias}")
-                
-        elif intent == "register":
-            if user:
-                print(f"[DEBUG] ⚠️ Registration Warning: Identity {alias} already exists. Proceeding as login.")
-            else:
-                user = UserNode(alias=alias, ed25519_pubkey=ed25519_pub_hex, dh_pubkey=dh_pub_hex)
-                db.add(user)
-                db.commit()
-                print(f"[DEBUG] ✅ New Identity Registered: {alias}")
+        if intent == "login" and not user:
+            await websocket.send_text(json.dumps({"type": "auth_error", "message": "Identity not found. Please register first."}))
+            await websocket.close(code=4004)
+            return
+        elif intent == "register" and not user:
+            user = UserNode(alias=alias, ed25519_pubkey=ed25519_pub_hex, dh_pubkey=dh_pub_hex)
+            db.add(user)
+            db.commit()
 
         await manager.connect(alias, websocket)
 
+        # Include msg_id in the history fetch
         history = db.query(FeedMessage).order_by(FeedMessage.created_at.desc()).limit(50).all()
         history.reverse()
         
         historical_payloads = [{
             "type": "feed_message",
+            "msg_id": msg.msg_id,
             "sender_alias": msg.sender_alias,
             "encryption_metadata": json.loads(msg.encryption_metadata),
             "ciphertext": msg.ciphertext,
             "signature": msg.signature,
-            "timestamp": msg.created_at.isoformat()
         } for msg in history]
         
         await websocket.send_text(json.dumps({"type": "history", "messages": historical_payloads}))
 
-        # X-RAY DEBUGGING LOOP
+        # EVENT LISTENER LOOP
         while True:
             try:
                 data_raw = await websocket.receive_text()
                 msg_data = json.loads(data_raw)
-                print(f"\n[DEBUG] 1. Received from React: {msg_data}")
-                
-                metadata = msg_data.get("encryption_metadata")
-                ciphertext = msg_data.get("ciphertext")
-                signature = msg_data.get("signature")
-                
-                if not metadata or not ciphertext or not signature:
-                    print("[DEBUG] ❌ Error: Missing fields in the payload.")
-                    continue
+                action = msg_data.get("action", "post")
 
-                try:
-                    verify_key.verify(bytes.fromhex(signature), ciphertext.encode('utf-8'))
-                    print("[DEBUG] 2. Cryptographic Signature Valid!")
-                except Exception as e:
-                    print(f"[DEBUG] ❌ Error: Invalid Signature! Dropping message. Details: {e}")
-                    continue
+                # Handle Posting a New Message
+                if action == "post":
+                    msg_id = msg_data.get("msg_id")
+                    metadata = msg_data.get("encryption_metadata")
+                    ciphertext = msg_data.get("ciphertext")
+                    signature = msg_data.get("signature")
+                    
+                    if not msg_id or not metadata or not ciphertext or not signature:
+                        continue
 
-                new_msg = FeedMessage(
-                    sender_alias=alias,
-                    encryption_metadata=json.dumps(metadata),
-                    ciphertext=ciphertext,
-                    signature=signature
-                )
-                db.add(new_msg)
-                db.commit()
-                print("[DEBUG] 3. Successfully saved to PostgreSQL!")
+                    try:
+                        # Verify signature over msg_id + ciphertext
+                        verify_key.verify(bytes.fromhex(signature), (msg_id + ciphertext).encode('utf-8'))
+                    except Exception as e:
+                        print(f"Signature mismatch on post: {e}")
+                        continue
 
-                await manager.broadcast({
-                    "type": "feed_message",
-                    "sender_alias": alias,
-                    "encryption_metadata": metadata,
-                    "ciphertext": ciphertext,
-                    "signature": signature
-                })
-                print("[DEBUG] 4. Broadcasted message to all connected clients!")
+                    new_msg = FeedMessage(
+                        msg_id=msg_id,
+                        sender_alias=alias,
+                        encryption_metadata=json.dumps(metadata),
+                        ciphertext=ciphertext,
+                        signature=signature
+                    )
+                    db.add(new_msg)
+                    db.commit()
 
-            except Exception as e:
-                print(f"[DEBUG] ❌ FATAL LOOP CRASH: {e}")
+                    await manager.broadcast({
+                        "type": "feed_message",
+                        "msg_id": msg_id,
+                        "sender_alias": alias,
+                        "encryption_metadata": metadata,
+                        "ciphertext": ciphertext,
+                        "signature": signature
+                    })
+
+                # Handle Deleting an Existing Message
+                elif action == "delete":
+                    msg_id = msg_data.get("msg_id")
+                    signature = msg_data.get("signature")
+
+                    try:
+                        # Verify the user actually signed the intent to delete THIS specific message
+                        verify_key.verify(bytes.fromhex(signature), f"delete_{msg_id}".encode('utf-8'))
+                    except Exception as e:
+                        print(f"Signature mismatch on delete: {e}")
+                        continue
+
+                    # Ensure the user is the original author of the post before deleting
+                    msg_to_delete = db.query(FeedMessage).filter(FeedMessage.msg_id == msg_id, FeedMessage.sender_alias == alias).first()
+                    if msg_to_delete:
+                        db.delete(msg_to_delete)
+                        db.commit()
+                        
+                        # Tell all connected clients to remove this message from their screens instantly
+                        await manager.broadcast({
+                            "type": "message_deleted",
+                            "msg_id": msg_id
+                        })
+
+            except Exception:
                 break
 
     except WebSocketDisconnect:
