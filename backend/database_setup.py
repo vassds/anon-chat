@@ -1,0 +1,36 @@
+import datetime
+import os
+from sqlalchemy import Column, String, Integer, DateTime, Text, ForeignKey, create_engine
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, relationship
+
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:vassds@localhost:5432/anon_feed")
+
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+class UserNode(Base):
+    __tablename__ = "users"
+
+    alias = Column(String(50), primary_key=True, index=True)
+    ed25519_pubkey = Column(String(64), nullable=False, unique=True)
+    dh_pubkey = Column(String(64), nullable=False)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+    messages = relationship("FeedMessage", back_populates="sender")
+
+class FeedMessage(Base):
+    __tablename__ = "feed_messages"
+
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    sender_alias = Column(String(50), ForeignKey("users.alias"), nullable=False)
+    encryption_metadata = Column(Text, nullable=False)
+    ciphertext = Column(Text, nullable=False)
+    signature = Column(String(128), nullable=False)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, index=True)
+
+    sender = relationship("UserNode", back_populates="messages")
+
+def init_db():
+    Base.metadata.create_all(bind=engine)
